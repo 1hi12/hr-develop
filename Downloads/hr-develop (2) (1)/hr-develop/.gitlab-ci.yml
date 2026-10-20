@@ -1,0 +1,88 @@
+# ================================================================
+# GitLab CI/CD — HR System
+# Pipeline : BUILD → UAT → PROD
+# Variables utilisées : uniquement les variables built-in GitLab
+#   CI_REGISTRY, CI_REGISTRY_USER, CI_REGISTRY_PASSWORD (auto)
+#   CI_REGISTRY_IMAGE, CI_COMMIT_SHORT_SHA, CI_COMMIT_BRANCH (auto)
+# ================================================================
+
+variables:
+  DOCKER_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  DOCKER_IMAGE_LATEST: "$CI_REGISTRY_IMAGE:latest"
+  DOCKER_IMAGE_UAT: "$CI_REGISTRY_IMAGE:uat"
+  DOCKER_IMAGE_PROD: "$CI_REGISTRY_IMAGE:prod"
+
+stages:
+  - build
+  - uat
+  - prod
+
+# ================================================================
+# STAGE 1 — BUILD DOCKER IMAGE
+# Utilise Kaniko (gcr.io) — pas de Docker Hub, pas de rate limit
+# Images de base : public.ecr.aws (AWS ECR Public, sans auth)
+# ================================================================
+
+build:docker:
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.0-debug
+    entrypoint: [""]
+  stage: build
+  script:
+    - mkdir -p /kaniko/.docker
+    - >
+      echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n $CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD | base64)\"}}}"
+      > /kaniko/.docker/config.json
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+      --destination "$DOCKER_IMAGE"
+      --destination "$DOCKER_IMAGE_LATEST"
+      --cache=true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# ================================================================
+# STAGE 2 — UAT : taguer l'image comme :uat
+# quay.io/skopeo — pas de Docker Hub, pas de rate limit
+# Utilise uniquement CI_REGISTRY_* (variables built-in GitLab)
+# ================================================================
+
+promote:uat:
+  image: quay.io/skopeo/stable:latest
+  stage: uat
+  needs:
+    - job: build:docker
+  script:
+    - skopeo copy
+      --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD"
+      --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD"
+      "docker://$DOCKER_IMAGE"
+      "docker://$DOCKER_IMAGE_UAT"
+    - echo "Image UAT disponible => $DOCKER_IMAGE_UAT"
+  environment:
+    name: uat
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# ================================================================
+# STAGE 3 — PROD : taguer l'image comme :prod (déclenchement manuel)
+# ================================================================
+
+promote:prod:
+  image: quay.io/skopeo/stable:latest
+  stage: prod
+  needs:
+    - job: promote:uat
+  script:
+    - skopeo copy
+      --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD"
+      --dest-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD"
+      "docker://$DOCKER_IMAGE"
+      "docker://$DOCKER_IMAGE_PROD"
+    - echo "Image PROD disponible => $DOCKER_IMAGE_PROD"
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: manual

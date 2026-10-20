@@ -1,0 +1,20 @@
+# ================================================================
+# Variables CI/CD — à remplir avec les vraies valeurs
+# Ce fichier est inclus dans .gitlab-ci.yml
+# ATTENTION : ne pas commit des vraies clés SSH dans un repo public
+# ================================================================
+
+variables:
+  DEPLOY_SERVER: "10.241.109.34"
+  DEPLOY_USER: "iarhpoc_hhadded"
+  POSTGRES_USER: "postgres"
+  POSTGRES_PASSWORD: "postgres"
+
+  # Mot de passe SSH pour le déploiement UAT
+  SSH_PASSWORD: "REMPLACER_PAR_MOT_DE_PASSE_SSH"
+
+  # Clé privée SSH pour le déploiement PROD (copier le contenu de id_rsa)
+  SSH_PRIVATE_KEY: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    REMPLACER_PAR_CONTENU_CLE_PRIVEE
+    -----END OPENSSH PRIVATE KEY-----

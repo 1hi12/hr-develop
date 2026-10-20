@@ -1,0 +1,916 @@
+"""
+/api/v1/postings — Job postings CRUD and matching endpoints.
+"""
+
+import asyncio
+import logging
+import re
+from typing import Optional
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from pydantic import BaseModel, Field
+
+from app.infrastructure.repositories.job_posting_repo import JobPostingRepository
+from app.infrastructure.repositories.candidate_repo import CandidateRepository
+from app.infrastructure.parsers.document_parser import DocumentParser
+from app.config.settings import settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/postings", tags=["Job Postings"])
+
+
+# ─────────────────────────────────────────────────────────────
+# Department auto-extraction
+# ─────────────────────────────────────────────────────────────
+
+_DEPT_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("DevOps",            ["devops", " sre ", "cloud architect", " infra ", "platform engineer", "kubernetes", "docker", "terraform", "ansible", "ops engineer"]),
+    ("Frontend",          ["frontend", "front-end", "react", " vue", "angular", " ui ", " ux ", "web designer", "interface"]),
+    ("Backend",           ["backend", "back-end", " api ", "django", "fastapi", "spring", "node", " php", "golang", " go ", "server"]),
+    ("Fullstack",         ["fullstack", "full stack", "full-stack"]),
+    ("Mobile",            ["mobile", " ios ", "android", "flutter", "react native", "swift", "kotlin"]),
+    ("Data Science",      ["data scien", "machine learning", "ml engineer", "deep learning", " nlp ", " ia ", " ai ", "artificial intel", " llm", "data scientist"]),
+    ("Data Engineering",  ["data engineer", "data analyst", "analytics", " bi ", "etl", "business intel", "data pipeline"]),
+    ("Cybersécurité",     ["security", "sécurité", "cybersec", "pentest", " soc ", "cyber"]),
+    ("IT",                ["it support", "system admin", "network engineer", "infrastructure", "informatique"]),
+    ("QA / Testing",      [" qa ", "quality assurance", "test engineer", "qualité", "tester"]),
+    ("Product",           ["product manager", "product owner", "chef de produit", "product lead", " po ", " pm ", "scrum", "agile"]),
+    ("Design",            ["ux designer", "ui designer", "ux/ui", "graphic designer", "motion designer", "visual designer", "product designer"]),
+    ("Human Resources",   ["ressources humaines", "human resources", " rh ", "rrh", "recruteur", "recruiter", "talent acquisition", "people ops", "hr manager", "drh"]),
+    ("Finance",           ["finance manager", "comptable", "comptabilité", "accounting", "financial analyst", "trésorerie", "controller", "cfo", "directeur financier"]),
+    ("Marketing",         ["marketing manager", "marketing specialist", "digital marketing", "growth hacker", " seo ", "content marketer", "brand manager", "campaign"]),
+    ("Sales",             ["sales manager", "head of sales", "sales engineer", "commercial", "account manager", "business development", " bdr", " sdr", "account executive", "sales director", "responsable commercial"]),
+    ("Legal",             ["legal", "juriste", "compliance officer", "avocat", "paralegal", "counsel"]),
+    ("Operations",        ["operations manager", "supply chain", "logistique", "procurement", "ops manager", "chief of staff"]),
+    ("Research",          ["research scientist", "chercheur", "r&d", "research engineer", "scientist"]),
+    ("Customer Success",  ["customer success", "support client", "customer support", "help desk", "customer experience"]),
+    ("Engineering",       ["software engineer", "développeur", "developer", "engineer", "architect", "ingénieur"]),  # Fallback générique
+]
+
+
+def _keyword_department(title: str, description: Optional[str]) -> Optional[str]:
+    """Fast keyword match against job title (and first 300 chars of description)."""
+    text = (title + " " + (description or "")[:300]).lower()
+    for dept, keywords in _DEPT_KEYWORDS:
+        if any(kw in text for kw in keywords):
+            return dept
+    return None
+
+
+async def _extract_department(title: str, description: Optional[str]) -> Optional[str]:
+    """Return department: keyword match first, Gemini fallback for ambiguous titles."""
+    # 1. Fast keyword check — no API call
+    dept = _keyword_department(title, description)
+    if dept:
+        return dept
+
+    # 2. Gemini fallback for unrecognised titles
+    api_key = settings.effective_api_key
+    if not api_key:
+        return None
+
+    prompt = (
+        "Return ONLY a short department label in English for this job posting. "
+        "Choose from: DevOps, Frontend, Backend, Fullstack, Mobile, Data Science, Data Engineering, "
+        "Cybersécurité, IT, QA / Testing, Product, Design, Human Resources, Finance, Marketing, "
+        "Sales, Legal, Operations, Research, Customer Success, Engineering.\n"
+        "One label only, no explanation.\n\n"
+        f"Job Title: {title}\n"
+        f"Description: {(description or '')[:600]}\n\n"
+        "Department:"
+    )
+
+    try:
+        import os, certifi
+        ca = certifi.where()
+        if not os.path.isfile(os.environ.get("SSL_CERT_FILE", "")):
+            os.environ["SSL_CERT_FILE"] = ca
+            os.environ["REQUESTS_CA_BUNDLE"] = ca
+
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=settings.litellm_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=10),
+        )
+        result = response.text.strip().strip('"').strip("'").strip()
+        return result or None
+    except Exception as exc:
+        logger.warning("[JobPosting] Department extraction failed: %s", exc)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Request/Response Models
+# ─────────────────────────────────────────────────────────────
+
+class CreateJobPostingRequest(BaseModel):
+    title: str = Field(..., min_length=3, max_length=512)
+    description: Optional[str] = None
+    department: Optional[str] = None
+    location: Optional[str] = None
+    employment_type: str = Field(default="full-time", pattern="^(full-time|part-time|contract|internship)$")
+    required_skills: list[str] = Field(default_factory=list)
+    preferred_skills: list[str] = Field(default_factory=list)
+    min_years_experience: Optional[float] = Field(default=None, ge=0)
+    max_years_experience: Optional[float] = Field(default=None, ge=0)
+    seniority_level: Optional[str] = Field(default=None, pattern="^(junior|mid|senior|lead|executive)$")
+    created_by: Optional[str] = None
+    nb_positions: Optional[int] = Field(default=None, ge=1)
+
+
+class UpdateJobPostingRequest(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=3, max_length=512)
+    description: Optional[str] = None
+    department: Optional[str] = None
+    location: Optional[str] = None
+    employment_type: Optional[str] = Field(default=None, pattern="^(full-time|part-time|contract|internship)$")
+    required_skills: Optional[list[str]] = None
+    preferred_skills: Optional[list[str]] = None
+    min_years_experience: Optional[float] = Field(default=None, ge=0)
+    max_years_experience: Optional[float] = Field(default=None, ge=0)
+    seniority_level: Optional[str] = Field(default=None, pattern="^(junior|mid|senior|lead|executive)$")
+    nb_positions: Optional[int] = Field(default=None, ge=1)
+
+
+class UpdateStatusRequest(BaseModel):
+    """Request body for updating job status."""
+    status: str = Field(..., pattern="^(active|draft|closed|archived)$")
+
+
+class JobPostingResponse(BaseModel):
+    job_id: str
+    title: str
+    description: Optional[str] = None
+    department: Optional[str] = None
+    location: Optional[str] = None
+    employment_type: str = "full-time"
+    required_skills: list[str] = []
+    preferred_skills: list[str] = []
+    min_years_experience: Optional[float] = None
+    max_years_experience: Optional[float] = None
+    seniority_level: Optional[str] = None
+    nb_positions: Optional[int] = None
+    status: str = "active"
+    created_by: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+    class Config:
+        from_attributes = True
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/upload-pdf", response_model=JobPostingResponse, status_code=201)
+async def upload_job_posting_pdf(file: UploadFile = File(...)):
+    """
+    Upload a PDF job posting and automatically create a job posting.
+    Extracts text without LLM processing and creates the posting directly.
+    
+    **Returns:** The created job posting.
+    """
+    try:
+        # Validate file type
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF files are supported"
+            )
+        
+        # Read file bytes
+        file_bytes = await file.read()
+        
+        if len(file_bytes) < 100:
+            raise HTTPException(
+                status_code=400,
+                detail="File is empty or too small"
+            )
+        
+        # Parse PDF with formatting preservation (Markdown)
+        parser = DocumentParser()
+        extracted_text = parser._extract_pdf_with_formatting(file_bytes)
+        
+        if not extracted_text or len(extracted_text.strip()) < 50:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract sufficient text from PDF"
+            )
+        
+        logger.info(
+            "[UploadJobPDF] Extracted %d characters from %s",
+            len(extracted_text),
+            file.filename
+        )
+        
+        # Clean text from PDF artifacts
+        cleaned_text = _clean_pdf_text(extracted_text)
+        
+        # Extract title from first meaningful line or filename
+        title = _extract_title_from_text(cleaned_text, file.filename)
+        
+        # ── Duplicate check (same title already exists) ───────────────────────
+        repo = JobPostingRepository()
+        existing = await repo.find_by_title(title)
+        if existing:
+            logger.info(
+                "[UploadJobPDF] Duplicate title blocked: %r (existing job_id=%s)",
+                title, existing.job_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DUPLICATE_JOB_POSTING",
+                    "message": f"Une offre d'emploi avec le titre « {title} » existe déjà.",
+                    "existing_job_id": existing.job_id,
+                    "existing_title": existing.title,
+                },
+            )
+
+        # Remove the title line from description to avoid duplication
+        description = _remove_title_from_description(cleaned_text, title)
+        
+        # Extract simple keywords as skills (no LLM, just regex)
+        skills = _extract_skills_simple(cleaned_text)
+
+        # Extract number of positions from PDF text
+        nb_positions = _extract_nb_positions(cleaned_text)
+        # Create job posting
+        job = await repo.create(
+            title=title,
+            description=description,
+            department=None,
+            location=None,
+            employment_type="full-time",
+            required_skills=skills,
+            preferred_skills=[],
+            min_years_experience=None,
+            max_years_experience=None,
+            seniority_level=None,
+            created_by="PDF Upload",
+            nb_positions=nb_positions,
+        )
+        
+        logger.info(
+            "[UploadJobPDF] Created job %s from PDF: %s",
+            job.job_id,
+            file.filename
+        )
+        
+        logger.info("[UploadJobPDF] nb_positions=%s for job %s", nb_positions, job.job_id)
+
+        return JobPostingResponse(
+            job_id=job.job_id,
+            title=job.title,
+            description=job.description,
+            department=job.department,
+            location=job.location,
+            employment_type=job.employment_type,
+            required_skills=job.required_skills,
+            preferred_skills=job.preferred_skills,
+            min_years_experience=job.min_years_experience,
+            max_years_experience=job.max_years_experience,
+            seniority_level=job.seniority_level,
+            nb_positions=job.nb_positions,
+            status=job.status,
+            created_by=job.created_by,
+            created_at=job.created_at.isoformat(),
+            updated_at=job.updated_at.isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error("[UploadJobPDF] Validation error: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("[UploadJobPDF] Error: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload and create job posting: {str(e)}"
+        )
+
+
+def _clean_pdf_text(text: str) -> str:
+    """
+    Clean PDF text by removing page markers and artifacts while preserving line structure.
+    """
+    import re
+    
+    # First, remove PDF character encoding artifacts like (cid:127)
+    text = re.sub(r'\(cid:\d+\)', '', text)
+    
+    # Split into lines to process each line
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    # Patterns to skip (page markers, dates, etc.)
+    skip_patterns = [
+        r'^\s*\[?\s*page\s+\d+\s*\]?\s*$',  # [Page 1], Page 1, [Page 2], etc.
+        r'^posted\s+on\s+',                  # Posted on May 12, 2026
+        r'^active\s*$',                      # Active
+        r'^\s*\d+\s*$',                      # Just a number alone
+    ]
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Check if line should be skipped
+        should_skip = False
+        for pattern in skip_patterns:
+            if re.match(pattern, line_lower, re.IGNORECASE):
+                should_skip = True
+                break
+        
+        if not should_skip:
+            # Keep the line with its original spacing (but remove extra spaces within text)
+            cleaned_line = re.sub(r' {2,}', ' ', line)
+            cleaned_lines.append(cleaned_line)
+    
+    # Join lines back, preserving original line breaks
+    cleaned_text = '\n'.join(cleaned_lines)
+    
+    # Remove only excessive blank lines (more than 2 consecutive)
+    cleaned_text = re.sub(r'\n\s*\n\s*\n\s*\n+', '\n\n', cleaned_text)
+    
+    return cleaned_text.strip()
+
+
+def _extract_title_from_text(text: str, filename: str) -> str:
+    """
+    Extract job title from PDF text, skipping page headers and artifacts.
+    Removes markdown headers (#) from the title.
+    """
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    
+    # Skip common PDF artifacts and page markers
+    skip_patterns = [
+        r'^\[?page\s+\d+\]?$',  # [Page 1], Page 1, etc.
+        r'^p\s*\d+$',            # P1, P 1
+        r'^\d+$',                 # Just a number
+        r'^-+$',                  # Dashes
+        r'^_+$',                  # Underscores
+    ]
+    
+    for line in lines:
+        line_lower = line.lower()
+        
+        # Check if line matches any skip pattern
+        should_skip = False
+        for pattern in skip_patterns:
+            if re.match(pattern, line_lower):
+                should_skip = True
+                break
+        
+        if should_skip:
+            continue
+        
+        # Skip very short lines (likely not titles)
+        if len(line) < 10:
+            continue
+        
+        # Found a good candidate for title
+        title = line
+        
+        # Remove markdown headers (# at the start)
+        title = re.sub(r'^#+\s*', '', title)
+        
+        # Limit title length
+        if len(title) > 100:
+            title = title[:97] + "..."
+        
+        return title
+    
+    # Fallback to filename if no good title found
+    return Path(filename).stem
+
+
+def _remove_title_from_description(text: str, title: str) -> str:
+    """
+    Remove the title line from description to avoid duplication.
+    Looks for the first line that matches the title (with or without markdown #).
+    """
+    lines = text.split('\n')
+    
+    # Find and remove the first line that contains the title
+    result_lines = []
+    title_found = False
+    
+    for line in lines:
+        # Remove markdown headers from line for comparison
+        line_clean = re.sub(r'^#+\s*', '', line.strip())
+        
+        # Check if this line matches the title
+        if not title_found and line_clean == title:
+            title_found = True
+            continue  # Skip this line
+        
+        result_lines.append(line)
+    
+    return '\n'.join(result_lines).strip()
+
+
+def _extract_nb_positions(text: str) -> Optional[int]:
+    """
+    Extract number of open positions from PDF text using strict regex.
+    Returns None if not found (triggers frontend popup).
+    Only matches very explicit "N positions to fill" phrases, not generic job description text.
+    """
+    patterns = [
+        # English — explicit field labels only
+        r'(?:number\s+of\s+(?:open\s+)?positions?|openings?|vacancies|headcount)\s*[:\-]\s*(\d+)',
+        r'(?:we\s+are\s+)?(?:hiring|recruiting)\s+(\d+)\s+(?:candidates?|profiles?|people)',
+        r'(\d+)\s+(?:open\s+)?(?:vacancies|openings?)',
+        r'(?:fill|recruit)\s+(\d+)\s+(?:positions?|seats?)',
+        # French — explicit phrases only
+        r'(?:nombre\s+de\s+postes?|postes?\s+[àa]\s+pourvoir)\s*[:\-]\s*(\d+)',
+        r'(\d+)\s+postes?\s+(?:[àa]\s+pourvoir|disponibles?|ouverts?)',
+        r'nous\s+(?:recrutons?|recherchons?)\s+(\d+)\s+(?:candidats?|profils?|personnes?)',
+        r'(?:recrutement|embauche)\s+de\s+(\d+)\s+(?:personnes?|candidats?|profils?)',
+    ]
+    text_lower = text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            val = int(match.group(1))
+            if 1 <= val <= 100:
+                logger.info("[ExtractNbPositions] Found %d via pattern: %s", val, pattern)
+                return val
+    return None
+
+
+def _extract_skills_simple(text: str) -> list[str]:
+    """
+    Extract skills using simple keyword matching (no LLM).
+    Looks for common technical skills in the text.
+    """
+    common_skills = [
+        # Languages
+        "Python", "Java", "JavaScript", "TypeScript", "C++", "C#", "Go", "Rust", 
+        "PHP", "Ruby", "Swift", "Kotlin", "Scala", "R", "SQL",
+        # Frameworks
+        "React", "Vue", "Angular", "Django", "Flask", "FastAPI", "Spring", 
+        "Node.js", "Express", "Next.js", "Nuxt", ".NET",
+        # Databases
+        "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", 
+        "Oracle", "SQL Server", "Cassandra",
+        # DevOps & Cloud
+        "Docker", "Kubernetes", "AWS", "Azure", "GCP", "Jenkins", "GitLab", 
+        "Terraform", "Ansible", "CI/CD",
+        # Data & AI
+        "TensorFlow", "PyTorch", "Pandas", "NumPy", "Scikit-learn", 
+        "Machine Learning", "Deep Learning", "NLP", "LLM",
+        # Others
+        "Git", "Linux", "Agile", "Scrum", "REST", "GraphQL", "Microservices"
+    ]
+    
+    found_skills = []
+    text_lower = text.lower()
+    
+    for skill in common_skills:
+        # Check if skill appears as whole word
+        if re.search(rf'\b{re.escape(skill.lower())}\b', text_lower):
+            found_skills.append(skill)
+    
+    return found_skills[:15]  # Limit to 15 skills max
+
+
+@router.post("", response_model=JobPostingResponse, status_code=201)
+async def create_job_posting(request: CreateJobPostingRequest):
+    """
+    Create a new job posting.
+    
+    **Returns:** The created job posting with job_id.
+    """
+    repo = JobPostingRepository()
+
+    try:
+        # ── Duplicate title check ─────────────────────────────────────────────
+        existing = await repo.find_by_title(request.title)
+        if existing:
+            logger.info(
+                "[CreateJobPosting] Duplicate title blocked: %r (existing job_id=%s)",
+                request.title, existing.job_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DUPLICATE_JOB_POSTING",
+                    "message": f"Une offre d'emploi avec le titre « {request.title} » existe déjà.",
+                    "existing_job_id": existing.job_id,
+                    "existing_title": existing.title,
+                },
+            )
+
+        # Auto-extract department via Gemini if not provided
+        department = request.department
+        if not department:
+            department = await _extract_department(request.title, request.description)
+            if department:
+                logger.info("[CreateJobPosting] Auto-extracted department: %s", department)
+
+        job = await repo.create(
+            title=request.title,
+            description=request.description,
+            department=department,
+            location=request.location,
+            employment_type=request.employment_type,
+            required_skills=request.required_skills,
+            preferred_skills=request.preferred_skills,
+            min_years_experience=request.min_years_experience,
+            max_years_experience=request.max_years_experience,
+            seniority_level=request.seniority_level,
+            created_by=request.created_by,
+            nb_positions=request.nb_positions,
+        )
+        logger.info("[CreateJobPosting] Created job %s: %s (dept=%s, nb_positions=%s)", job.job_id, job.title, job.department, job.nb_positions)
+        return JobPostingResponse(
+            job_id=job.job_id, title=job.title, description=job.description,
+            department=job.department, location=job.location,
+            employment_type=job.employment_type, required_skills=job.required_skills,
+            preferred_skills=job.preferred_skills,
+            min_years_experience=job.min_years_experience,
+            max_years_experience=job.max_years_experience,
+            seniority_level=job.seniority_level, nb_positions=job.nb_positions,
+            status=job.status, created_by=job.created_by,
+            created_at=job.created_at.isoformat(), updated_at=job.updated_at.isoformat(),
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 409 duplicate) without modification
+        raise
+
+    except Exception as e:
+        logger.error("[CreateJobPosting] Error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to create job posting: {str(e)}")
+
+
+@router.get("", response_model=list[JobPostingResponse])
+async def list_job_postings(
+    status: Optional[str] = Query(default=None, pattern="^(active|draft|closed|archived)$"),
+    include_archived: bool = Query(default=False, description="Include archived jobs in results"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    List all job postings, optionally filtered by status.
+    
+    **Query Parameters:**
+    - status: Filter by status (active, paused, closed, archived)
+    - include_archived: Include archived jobs (default: False)
+    - limit: Maximum number of results (default: 50, max: 100)
+    - offset: Number of results to skip (pagination)
+    
+    **Note:** By default, archived jobs are excluded from results.
+    To see archived jobs, either set status=archived or include_archived=true.
+    
+    **Returns:** List of job postings.
+    """
+    repo = JobPostingRepository()
+    
+    try:
+        jobs = await repo.list_all(
+            status=status, 
+            include_archived=include_archived,
+            limit=limit, 
+            offset=offset
+        )
+        
+        return [
+            JobPostingResponse(
+                job_id=job.job_id, title=job.title, description=job.description,
+                department=job.department, location=job.location,
+                employment_type=job.employment_type, required_skills=job.required_skills,
+                preferred_skills=job.preferred_skills,
+                min_years_experience=job.min_years_experience,
+                max_years_experience=job.max_years_experience,
+                seniority_level=job.seniority_level, nb_positions=job.nb_positions,
+                status=job.status, created_by=job.created_by,
+                created_at=job.created_at.isoformat(), updated_at=job.updated_at.isoformat(),
+            )
+            for job in jobs
+        ]
+    except Exception as e:
+        logger.error("[ListJobPostings] Error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to list job postings: {str(e)}")
+
+
+@router.get("/{job_id}", response_model=JobPostingResponse)
+async def get_job_posting(job_id: str):
+    """
+    Get a specific job posting by ID.
+    
+    **Returns:** The job posting details.
+    """
+    repo = JobPostingRepository()
+    
+    job = await repo.get_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+    
+    return JobPostingResponse(
+        job_id=job.job_id, title=job.title, description=job.description,
+        department=job.department, location=job.location,
+        employment_type=job.employment_type, required_skills=job.required_skills,
+        preferred_skills=job.preferred_skills,
+        min_years_experience=job.min_years_experience,
+        max_years_experience=job.max_years_experience,
+        seniority_level=job.seniority_level, nb_positions=job.nb_positions,
+        status=job.status, created_by=job.created_by,
+        created_at=job.created_at.isoformat(), updated_at=job.updated_at.isoformat(),
+    )
+
+
+@router.patch("/{job_id}", response_model=JobPostingResponse)
+async def update_job_posting(job_id: str, request: UpdateJobPostingRequest):
+    """
+    Update a job posting (partial update).
+
+    **Returns:** The updated job posting.
+    """
+    repo = JobPostingRepository()
+
+    job = await repo.update(
+        job_id=job_id,
+        title=request.title, description=request.description,
+        department=request.department, location=request.location,
+        employment_type=request.employment_type,
+        required_skills=request.required_skills, preferred_skills=request.preferred_skills,
+        min_years_experience=request.min_years_experience,
+        max_years_experience=request.max_years_experience,
+        seniority_level=request.seniority_level,
+        nb_positions=request.nb_positions,
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+    logger.info("[UpdateJobPosting] Updated job %s (nb_positions=%s)", job_id, job.nb_positions)
+    return JobPostingResponse(
+        job_id=job.job_id, title=job.title, description=job.description,
+        department=job.department, location=job.location,
+        employment_type=job.employment_type, required_skills=job.required_skills,
+        preferred_skills=job.preferred_skills,
+        min_years_experience=job.min_years_experience,
+        max_years_experience=job.max_years_experience,
+        seniority_level=job.seniority_level, nb_positions=job.nb_positions,
+        status=job.status, created_by=job.created_by,
+        created_at=job.created_at.isoformat(), updated_at=job.updated_at.isoformat(),
+    )
+
+
+@router.patch("/{job_id}/status", response_model=JobPostingResponse)
+async def update_job_status(job_id: str, request: UpdateStatusRequest):
+    """
+    Update job posting status.
+
+    **Valid statuses:** active, paused, closed, archived
+
+    **Returns:** The updated job posting.
+    """
+    repo = JobPostingRepository()
+
+    job = await repo.update_status(job_id, request.status)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+
+    logger.info("[UpdateJobStatus] Job %s status changed to %s", job_id, request.status)
+    return JobPostingResponse(
+        job_id=job.job_id, title=job.title, description=job.description,
+        department=job.department, location=job.location,
+        employment_type=job.employment_type, required_skills=job.required_skills,
+        preferred_skills=job.preferred_skills,
+        min_years_experience=job.min_years_experience,
+        max_years_experience=job.max_years_experience,
+        seniority_level=job.seniority_level, nb_positions=job.nb_positions,
+        status=job.status, created_by=job.created_by,
+        created_at=job.created_at.isoformat(), updated_at=job.updated_at.isoformat(),
+    )
+
+
+@router.delete("/{job_id}", status_code=204)
+async def delete_job_posting(job_id: str):
+    """
+    Delete a job posting.
+    
+    **Returns:** 204 No Content on success.
+    """
+    repo = JobPostingRepository()
+    
+    deleted = await repo.delete(job_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+    
+    logger.info("[DeleteJobPosting] Deleted job %s", job_id)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Matching Endpoint
+# ─────────────────────────────────────────────────────────────
+
+class CandidateMatch(BaseModel):
+    """Single candidate match with all scoring details."""
+    candidate_id:         str
+    name:                 str
+    experience:           str
+    skill:                str          # primary skill badge
+    status:               str = "pending"  # Candidate status
+    # New scoring fields (0-100)
+    score:                float        # alias for final_score (backward compat)
+    skill_score:          float        # cosine similarity * 100
+    seniority_multiplier: float        # 0.50 – 1.00
+    final_score:          float        # 70% cosine + 30% seniority
+    seniority_gap:        int          # candidate_rank - job_rank
+    # Skill breakdown
+    matched_skills:       list[str]
+    missing_skills:       list[str]
+    # AI analysis in French
+    ai_description:       str = ""
+    # Performance
+    scoring_time_s:       float = 0.0
+
+
+class MatchingResponse(BaseModel):
+    """Response for job posting matching."""
+    job_id:                  str
+    job_title:               str
+    total_candidates:        int
+    matched_candidates:      list[CandidateMatch]
+    recruiter_advice:        str
+    total_processing_time_s: float = 0.0
+
+
+async def _run_matching_pipeline(
+    job,
+    top_k: int,
+    min_score: float,
+    ai_descriptions: bool,
+) -> MatchingResponse:
+    """Run the full matching pipeline and return a MatchingResponse."""
+    import time as _t
+    from app.services.job_matching import get_cv_job_matcher
+
+    t0 = _t.monotonic()
+    matcher = get_cv_job_matcher()
+    results = await matcher.match(
+        job_title=job.title,
+        job_description=job.description or "",
+        required_skills=job.required_skills or [],
+        job_seniority=job.seniority_level,
+        top_k=top_k,
+        min_score=min_score,
+        generate_ai_desc=ai_descriptions,
+    )
+
+    matched_candidates = []
+    for r in results:
+        years_exp = r.years_experience or 0
+        exp_str   = f"{int(years_exp)}Y Exp" if years_exp >= 1 else f"{int(years_exp * 12)}M Exp"
+        primary   = r.matched_skills[0] if r.matched_skills else (r.candidate_skills[0] if r.candidate_skills else "N/A")
+
+        matched_candidates.append(CandidateMatch(
+            candidate_id=r.candidate_id,
+            name=r.full_name,
+            experience=exp_str,
+            skill=f"#{primary.upper()}",
+            status=r.status,
+            score=round(r.score.final_score, 1),
+            skill_score=round(r.score.skill_score, 1),
+            seniority_multiplier=round(r.score.seniority_multiplier, 2),
+            final_score=round(r.score.final_score, 1),
+            seniority_gap=r.score.seniority_gap,
+            matched_skills=r.matched_skills,
+            missing_skills=r.missing_skills,
+            ai_description=r.ai_description,
+            scoring_time_s=round(r.scoring_time_s, 3),
+        ))
+
+    n_good    = sum(1 for c in matched_candidates if c.final_score >= 60)
+    avg_score = (sum(c.final_score for c in matched_candidates) / len(matched_candidates)) if matched_candidates else 0
+    skills_str = ", ".join(job.required_skills[:5]) if job.required_skills else "non spécifié"
+
+    recruiter_advice = (
+        f"{n_good} candidat(s) sur {len(matched_candidates)} dépassent le seuil de 60/100 "
+        f"(score moyen : {avg_score:.0f}/100). "
+        f"Compétences requises : {skills_str}. "
+        f"Les scores combinent 70 % similarité sémantique + 30 % adéquation séniorité."
+    )
+
+    total_time = round(_t.monotonic() - t0, 2)
+    return MatchingResponse(
+        job_id=job.job_id,
+        job_title=job.title,
+        total_candidates=len(matched_candidates),
+        matched_candidates=matched_candidates,
+        recruiter_advice=recruiter_advice,
+        total_processing_time_s=total_time,
+    )
+
+
+@router.get("/{job_id}/match", response_model=MatchingResponse)
+async def match_candidates_for_job(
+    job_id: str,
+    top_k: int = Query(default=10, ge=1, le=50, description="Number of top candidates to return"),
+    min_score: float = Query(default=0.25, ge=0.0, le=1.0, description="Minimum cosine score threshold"),
+    ai_descriptions: bool = Query(default=True, description="Generate French AI analysis per candidate"),
+):
+    """
+    Match candidates to a job posting — Redis-cached (24 h TTL).
+
+    Returns cached results when the candidate pool has not changed.
+    Cache is invalidated automatically when new CVs are ingested.
+    Use POST /{job_id}/recalculate to force a fresh run.
+    """
+    from app.services import matching_cache
+
+    repo = JobPostingRepository()
+    job  = await repo.get_by_id(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+
+    if job.status != "active":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot match candidates for a {job.status} job posting",
+        )
+
+    try:
+        # ── Cache check ──────────────────────────────────────────────
+        candidate_ids = await matching_cache.fetch_all_candidate_ids()
+        stale = await matching_cache.is_cache_stale(job_id, candidate_ids)
+
+        if not stale:
+            cached = await matching_cache.get_cached_results(job_id)
+            if cached is not None:
+                logger.info("[MatchJobPosting] Cache HIT for job %s", job_id)
+                return MatchingResponse(**cached)
+
+        # ── Cache miss or stale → run pipeline ───────────────────────
+        logger.info("[MatchJobPosting] Cache MISS for job %s — running pipeline", job_id)
+        response = await _run_matching_pipeline(job, top_k, min_score, ai_descriptions)
+
+        # Store results in Redis
+        await matching_cache.set_cached_results(
+            job_id,
+            response.model_dump(),
+            candidate_ids,
+        )
+
+        logger.info("[MatchJobPosting] Job %s → %d candidates stored in cache", job_id, response.total_candidates)
+        return response
+
+    except Exception as e:
+        logger.error("[MatchJobPosting] Error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
+
+
+@router.post("/{job_id}/recalculate", response_model=MatchingResponse)
+async def recalculate_match(
+    job_id: str,
+    top_k: int = Query(default=10, ge=1, le=50),
+    min_score: float = Query(default=0.25, ge=0.0, le=1.0),
+    ai_descriptions: bool = Query(default=True),
+):
+    """
+    Force a fresh matching run for a job, bypassing the Redis cache.
+
+    Use this when the recruiter clicks "Recalculate" in the UI.
+    The new results replace the cached ones.
+    """
+    from app.services import matching_cache
+
+    repo = JobPostingRepository()
+    job  = await repo.get_by_id(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found")
+
+    if job.status != "active":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot match candidates for a {job.status} job posting",
+        )
+
+    try:
+        candidate_ids = await matching_cache.fetch_all_candidate_ids()
+        response = await _run_matching_pipeline(job, top_k, min_score, ai_descriptions)
+
+        await matching_cache.set_cached_results(
+            job_id,
+            response.model_dump(),
+            candidate_ids,
+        )
+
+        logger.info("[RecalculateMatch] Job %s → %d candidates (cache refreshed)", job_id, response.total_candidates)
+        return response
+
+    except Exception as e:
+        logger.error("[RecalculateMatch] Error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Recalculate failed: {str(e)}")
+

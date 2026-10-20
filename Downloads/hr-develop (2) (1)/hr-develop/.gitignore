@@ -1,0 +1,83 @@
+# Environment files (contain API keys)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+
+lib64/
+
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Milvus data (if using local file storage)
+milvus_data/
+
+# Node (if frontend added later)
+node_modules/
+
+# Generated HTML diagrams & reports
+CV_Pipeline_UserJourneyMap.html
+JobMatching_Diagrams.html
+JobMatching_Manager_Guide.html
+architecture.html
+architecture_ia.html
+
+# Utility / maintenance scripts (not part of the app)
+apply_fix.py
+check_db_schema.py
+clean_milvus.py
+cleanup_milvus.py
+cleanup_orphans_simple.py
+download_model.py
+fix_cache_and_reindex.py
+generate_ai_core_diagram.py
+generate_presentation.py
+inspect_milvus.py
+recreate_milvus_for_new_embeddings.py
+
+# Local SQLite cache
+cv_pipeline_cache.db
+
+# Generated files
+*.html
+*.pdf
+rapport-pfe/
+

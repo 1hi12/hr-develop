@@ -1,0 +1,201 @@
+version: "3.9"
+
+# ============================================================
+# docker-compose UAT — HR System
+# Lance tous les services + tous les tests automatiquement
+# Commande : docker-compose -f docker-compose.uat.yml up --abort-on-container-exit
+# ============================================================
+
+networks:
+  uat_network:
+    driver: bridge
+
+volumes:
+  postgres_uat_data:
+  minio_uat_data:
+  etcd_uat_data:
+
+services:
+
+  # ──────────────────────────────────────────────
+  # POSTGRESQL — base de données UAT isolée
+  # ──────────────────────────────────────────────
+  postgres_uat:
+    image: postgres:15
+    container_name: hr_postgres_uat
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cv_db_uat
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_uat_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # REDIS — cache UAT isolé
+  # ──────────────────────────────────────────────
+  redis_uat:
+    image: redis:alpine
+    container_name: hr_redis_uat
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # ETCD — requis par Milvus
+  # ──────────────────────────────────────────────
+  etcd_uat:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: hr_etcd_uat
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+    volumes:
+      - etcd_uat_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # MINIO — stockage requis par Milvus
+  # ──────────────────────────────────────────────
+  minio_uat:
+    image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+    container_name: hr_minio_uat
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
+    volumes:
+      - minio_uat_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # MILVUS — base vectorielle UAT isolée
+  # ──────────────────────────────────────────────
+  milvus_uat:
+    image: milvusdb/milvus:v2.3.3
+    container_name: hr_milvus_uat
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd_uat:2379
+      MINIO_ADDRESS: minio_uat:9000
+    ports:
+      - "19531:19530"
+    depends_on:
+      etcd_uat:
+        condition: service_healthy
+      minio_uat:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # APPLICATION HR — serveur FastAPI UAT
+  # ──────────────────────────────────────────────
+  hr_app_uat:
+    image: hr-system:latest
+    container_name: hr_app_uat
+    command: ["./start.sh"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres_uat:5432/cv_db_uat
+      REDIS_URL: redis://redis_uat:6379
+      MILVUS_HOST: milvus_uat
+      MILVUS_PORT: "19530"
+      ENVIRONMENT: uat
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres_uat:
+        condition: service_healthy
+      redis_uat:
+        condition: service_healthy
+      milvus_uat:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # PYTEST — tous les tests UAT (DB + API + perf)
+  # ──────────────────────────────────────────────
+  pytest_uat:
+    image: hr-system:latest
+    container_name: hr_pytest_uat
+    command: >
+      pytest tests/uat/
+        -v
+        --tb=short
+        --junitxml=/reports/uat-results.xml
+        -p no:warnings
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres_uat:5432/cv_db_uat
+      REDIS_URL: redis://redis_uat:6379
+      MILVUS_HOST: milvus_uat
+      MILVUS_PORT: "19530"
+      API_URL: http://hr_app_uat:8000
+      ENVIRONMENT: uat
+    volumes:
+      - ./reports:/reports
+    depends_on:
+      hr_app_uat:
+        condition: service_healthy
+    networks:
+      - uat_network
+
+  # ──────────────────────────────────────────────
+  # CYPRESS — tests E2E frontend React
+  # ──────────────────────────────────────────────
+  cypress_uat:
+    image: cypress/included:13.6.0
+    container_name: hr_cypress_uat
+    environment:
+      CYPRESS_BASE_URL: http://hr_app_uat:8000
+    working_dir: /e2e
+    volumes:
+      - ./cypress:/e2e/cypress
+      - ./cypress.config.js:/e2e/cypress.config.js
+      - ./reports:/e2e/reports
+    depends_on:
+      hr_app_uat:
+        condition: service_healthy
+    networks:
+      - uat_network

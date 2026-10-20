@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+
+  # ── FastAPI HR App ────────────────────────────────────────────────
+  - job_name: 'hr-app'
+    static_configs:
+      - targets: ['hr-app:8000']
+    metrics_path: /metrics
+
+  # ── PostgreSQL ────────────────────────────────────────────────────
+  - job_name: 'postgresql'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # ── Milvus ────────────────────────────────────────────────────────
+  - job_name: 'milvus'
+    static_configs:
+      - targets: ['milvus-standalone:9091']
+    metrics_path: /metrics
+
+  # ── Prometheus lui-même ───────────────────────────────────────────
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

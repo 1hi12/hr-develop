@@ -1,0 +1,7 @@
+{
+  "venvPath": "/home/hhadded/backend",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "include": ["app"],
+  "extraPaths": ["/home/hhadded/backend"]
+}

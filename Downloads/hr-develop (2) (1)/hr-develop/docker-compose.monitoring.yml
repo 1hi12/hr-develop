@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hr_prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - hr_system_default
+      - hr_system-main_default
+    restart: unless-stopped
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hr_grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=localhost
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - hr_system_default
+    restart: unless-stopped
+
+  # ── PostgreSQL Exporter ───────────────────────────────────────────────────────
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: hr_postgres_exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres@cv_db_postgres:5432/cv_db?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - hr_system_default
+    restart: unless-stopped
+
+  # ── Redis Exporter ────────────────────────────────────────────────────────────
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: hr_redis_exporter
+    environment:
+      REDIS_ADDR: "redis://hr_redis:6379"
+    ports:
+      - "9121:9121"
+    networks:
+      - hr_system_default
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  hr_system_default:
+    external: true
+  hr_system-main_default:
+    external: true

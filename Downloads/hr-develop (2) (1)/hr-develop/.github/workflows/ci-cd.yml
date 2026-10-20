@@ -1,0 +1,342 @@
+# ============================================================
+# Pipeline CI/CD — HR System (DEV → UAT → PROD)
+# FastAPI + React + PostgreSQL + Milvus + Redis
+# ============================================================
+
+name: CI/CD Pipeline — HR System
+
+on:
+  push:
+    branches: [dev, main, staging]
+  pull_request:
+    branches: [main, staging]
+
+env:
+  IMAGE_NAME: hr-system
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+# ============================================================
+# PHASE 1 — DEV : Build + Tests Unitaires
+# ============================================================
+jobs:
+
+  # ── 1a. Tests unitaires Backend (pytest) ──────────────────
+  test-backend:
+    name: "DEV — Tests Backend (pytest)"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' || github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cv_db_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra libpq-dev
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests with pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/cv_db_test
+          REDIS_URL: redis://localhost:6379
+          MILVUS_HOST: localhost
+          ENVIRONMENT: test
+        run: |
+          pytest tests/ -v \
+            --tb=short \
+            --junitxml=reports/pytest-results.xml \
+            --cov=app \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term-missing \
+            -x
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-results
+          path: reports/
+
+  # ── 1b. Build + Tests Frontend (TypeScript / Vite) ────────
+  test-frontend:
+    name: "DEV — Build Frontend (React/Vite)"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' || github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: TypeScript check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: ESLint check
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+
+  # ── 1c. Build Docker Image ─────────────────────────────────
+  build-docker:
+    name: "DEV — Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ============================================================
+# PHASE 2 — UAT : Tests Intégration + Performance
+# ============================================================
+
+  # ── 2a. Tests d'intégration (httpx + API réelle) ──────────
+  test-integration:
+    name: "UAT — Tests Intégration API"
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cv_db_uat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr libpq-dev
+          pip install -r requirements.txt
+
+      - name: Run database migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/cv_db_uat
+        run: alembic upgrade head
+
+      - name: Start FastAPI server (background)
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/cv_db_uat
+          REDIS_URL: redis://localhost:6379
+          MILVUS_HOST: localhost
+          ENVIRONMENT: uat
+        run: |
+          uvicorn main:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+
+      - name: Run integration tests
+        run: |
+          pytest tests/ -v \
+            --tb=short \
+            -m "integration or not unit" \
+            --junitxml=reports/integration-results.xml
+        env:
+          API_BASE_URL: http://localhost:8000
+
+      - name: API health check
+        run: curl -f http://localhost:8000/health || exit 1
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: reports/
+
+  # ── 2b. Tests de performance (k6) ─────────────────────────
+  test-performance:
+    name: "UAT — Tests Performance (k6)"
+    runs-on: ubuntu-latest
+    needs: test-integration
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install k6
+
+      - name: Run k6 performance tests
+        run: |
+          k6 run .github/k6/load-test.js \
+            --out json=reports/k6-results.json \
+            --summary-export=reports/k6-summary.json
+        env:
+          API_URL: ${{ secrets.UAT_API_URL }}
+
+      - name: Upload k6 results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-test-results
+          path: reports/
+
+# ============================================================
+# PHASE 3 — PROD : Deploy Blue/Green + Monitoring
+# ============================================================
+
+  deploy-prod:
+    name: "PROD — Deploy Blue/Green"
+    runs-on: ubuntu-latest
+    needs: [test-integration, test-performance]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ secrets.PROD_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy to Production (Blue/Green)
+        run: |
+          echo "==> Deploying image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          # SSH vers le serveur de production
+          # ssh ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_HOST }} << 'EOF'
+          #   docker pull ghcr.io/${{ github.repository_owner }}/hr-system:latest
+          #   docker-compose -f docker-compose.prod.yml up -d --no-deps hr-app hr-worker
+          # EOF
+
+      - name: Health check production
+        run: |
+          sleep 15
+          curl -f ${{ secrets.PROD_URL }}/health || exit 1
+
+      - name: Rollback si erreur
+        if: failure()
+        run: |
+          echo "==> ERREUR detectee — Rollback en cours..."
+          # ssh ${{ secrets.PROD_SSH_USER }}@${{ secrets.PROD_HOST }} \
+          #   "docker-compose -f docker-compose.prod.yml rollback"
+
+      - name: Notify deploy success
+        if: success()
+        run: |
+          echo "Deploy PROD reussi - SHA: ${{ github.sha }}"
+          # curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          #   -d '{"text": "HR System deploye en PROD avec succes!"}'

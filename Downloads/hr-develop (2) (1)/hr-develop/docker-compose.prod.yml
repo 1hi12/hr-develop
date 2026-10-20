@@ -1,0 +1,199 @@
+version: "3.9"
+
+# ============================================================
+# docker-compose PROD — HR System
+# Base de données PROD isolée : cv_db_prod (port 5432)
+# Lancement : docker-compose -f docker-compose.prod.yml up -d
+# ============================================================
+
+networks:
+  prod_network:
+    driver: bridge
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+  minio_prod_data:
+  etcd_prod_data:
+
+services:
+
+  # ──────────────────────────────────────────────
+  # POSTGRESQL — base de données PROD
+  # ──────────────────────────────────────────────
+  postgres_prod:
+    image: postgres:15
+    container_name: hr_postgres_prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: cv_db_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # REDIS — cache PROD
+  # ──────────────────────────────────────────────
+  redis_prod:
+    image: redis:7-alpine
+    container_name: hr_redis_prod
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # ETCD — requis par Milvus
+  # ──────────────────────────────────────────────
+  etcd_prod:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: hr_etcd_prod
+    restart: always
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    volumes:
+      - etcd_prod_data:/etcd
+    command: >
+      etcd
+      -advertise-client-urls=http://etcd_prod:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # MINIO — stockage objet pour Milvus
+  # ──────────────────────────────────────────────
+  minio_prod:
+    image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+    container_name: hr_minio_prod
+    restart: always
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio_prod_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # MILVUS — base vectorielle PROD
+  # ──────────────────────────────────────────────
+  milvus_prod:
+    image: milvusdb/milvus:v2.3.3
+    container_name: hr_milvus_prod
+    restart: always
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd_prod:2379
+      MINIO_ADDRESS: minio_prod:9000
+    ports:
+      - "19530:19530"
+    depends_on:
+      etcd_prod:
+        condition: service_healthy
+      minio_prod:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # APPLICATION HR — FastAPI PROD
+  # ──────────────────────────────────────────────
+  hr_app_prod:
+    image: ${REGISTRY:-ghcr.io/ahmedsofrecom}/hr-system:latest
+    container_name: hr_app_prod
+    restart: always
+    command: ["./start.sh"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres_prod:5432/cv_db_prod
+      REDIS_URL: redis://redis_prod:6379
+      MILVUS_HOST: milvus_prod
+      MILVUS_PORT: "19530"
+      LITELLM_API_KEY: ${LITELLM_API_KEY}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL}
+      LITELLM_MODEL: ${LITELLM_MODEL:-anthropic/claude-3-haiku}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID}
+      ENVIRONMENT: production
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres_prod:
+        condition: service_healthy
+      redis_prod:
+        condition: service_healthy
+      milvus_prod:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+    networks:
+      - prod_network
+
+  # ──────────────────────────────────────────────
+  # ARQ WORKER — traitement CV en arrière-plan
+  # ──────────────────────────────────────────────
+  hr_worker_prod:
+    image: ${REGISTRY:-ghcr.io/ahmedsofrecom}/hr-system:latest
+    container_name: hr_worker_prod
+    restart: always
+    command: ["arq", "app.workers.arq_worker.WorkerSettings"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres_prod:5432/cv_db_prod
+      REDIS_URL: redis://redis_prod:6379
+      MILVUS_HOST: milvus_prod
+      MILVUS_PORT: "19530"
+      LITELLM_API_KEY: ${LITELLM_API_KEY}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL}
+      LITELLM_MODEL: ${LITELLM_MODEL:-anthropic/claude-3-haiku}
+      ENVIRONMENT: production
+    depends_on:
+      postgres_prod:
+        condition: service_healthy
+      redis_prod:
+        condition: service_healthy
+      milvus_prod:
+        condition: service_healthy
+    networks:
+      - prod_network

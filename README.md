@@ -2,21 +2,7 @@
 
 Application web qui automatise l'analyse des CV, le matching candidats / offres et la composition d'équipes projet grâce à un pipeline **RAG → DCI → LLM**.
 
-![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
-
-## 🖼️ Aperçu
-
-### 🔑 Connexion (e-mail ou SSO Microsoft)
-
-![Page de connexion](docs/screenshots/login.png)
-
-### 📊 Tableau de bord de recrutement
-
-![Tableau de bord](docs/screenshots/dashboard.png)
+`Python 3.10` · `FastAPI` · `React 18` · `PostgreSQL 15` · `Milvus` · `Redis` · `Docker`
 
 ## 📖 Description
 
@@ -39,8 +25,6 @@ HR System aide les équipes RH à gagner du temps sur trois tâches :
 - 🔐 **SSO Azure AD** et 🌍 interface FR / EN
 
 ## 🏗️ Architecture du pipeline IA
-
-![Architecture du pipeline](docs/screenshots/architecture-pipeline.png)
 
 ### Déroulement d'une analyse
 
@@ -79,7 +63,7 @@ HR System aide les équipes RH à gagner du temps sur trois tâches :
 | 🧠 IA / RAG | LangGraph, LiteLLM, Milvus |
 | 🗄️ Données | PostgreSQL, Redis, ARQ |
 | 🎨 Frontend | React, TypeScript, Vite, Tailwind CSS |
-| 🚢 DevOps | Docker, GitHub Actions, Prometheus, Grafana |
+| 🚢 DevOps | Docker, GitLab CI, Prometheus, Grafana |
 
 ## 📂 Structure
 
@@ -149,8 +133,6 @@ npx cypress run     # End-to-end
 
 Le pipeline CI/CD orchestre trois environnements : **DEV → UAT → PROD**.
 
-![Pipeline CI/CD](docs/screenshots/cicd-pipeline.png)
-
 | Environnement | Étapes |
 | --- | --- |
 | 🧑‍💻 **DEV** | Push Git, build Docker automatique, tests unitaires (pytest), déploiement auto |
@@ -162,8 +144,6 @@ Les images Docker sont stockées sur Docker Hub, et un retour (feedback, inciden
 ## 📊 Monitoring
 
 Supervision applicative avec Prometheus et Grafana : services actifs, latence, requêtes par endpoint, CPU, mémoire et état des workers.
-
-![Monitoring Grafana](docs/screenshots/monitoring.png)
 
 ```bash
 docker compose -f docker-compose.monitoring.yml up -d
